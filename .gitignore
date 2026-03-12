@@ -1,0 +1,22 @@
+# Environment
+.env
+venv/
+tmp/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.docx
+*doc.py
+# ChromaDB data
+chroma_data/
+chroma_gemini_data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
