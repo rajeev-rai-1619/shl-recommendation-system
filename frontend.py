@@ -3,7 +3,11 @@ import requests
 import pandas as pd
 import os
 
-API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000/recommend")
+# Check Streamlit secrets first (for Streamlit Cloud), then env var, then localhost
+try:
+    API_URL = st.secrets["API_URL"]
+except (KeyError, FileNotFoundError):
+    API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000/recommend")
 
 st.set_page_config(page_title="SHL Assessment Recommender", layout="wide")
 
