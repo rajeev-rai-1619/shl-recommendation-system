@@ -8,9 +8,8 @@ __pycache__/
 *.pyo
 *.docx
 *doc.py
-# ChromaDB data
+# ChromaDB data (keep chroma_gemini_data for deployment)
 chroma_data/
-chroma_gemini_data/
 
 # IDE
 .vscode/
