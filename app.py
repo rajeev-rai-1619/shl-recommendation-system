@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import logging
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -19,16 +20,34 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+def _call_with_retry(fn, max_retries=3):
+    """Call fn(), retrying on 429 RESOURCE_EXHAUSTED with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s
+                logger.warning("Rate limited (attempt %d/%d), waiting %ds...", attempt + 1, max_retries, wait)
+                time.sleep(wait)
+            else:
+                raise
+    # Final attempt without catching
+    return fn()
+
+
 # Custom embedding function for searching queries using Gemini embeddings
 class GeminiQueryEmbeddingFunction(EmbeddingFunction):
     def __call__(self, input: Documents) -> Embeddings:
-        result = client.models.embed_content(
-            model="gemini-embedding-001",
-            contents=input,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY" 
+        def _embed():
+            return client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=input,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_QUERY"
+                )
             )
-        )
+        result = _call_with_retry(_embed)
         return [e.values for e in result.embeddings]
 
 app = FastAPI(title="SHL Assessment Recommendation API")
@@ -95,10 +114,13 @@ Respond STRICTLY in this format (no extra text):
 Queries: query1 | query2 | query3 | query4
 Types: K, P, A"""
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
+        def _gen():
+            return client.models.generate_content(
+                model='gemini-2.5-flash-lite',
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0),
+            )
+        response = _call_with_retry(_gen)
         text = response.text
         search_queries = [query]  # always include original
         types_list = []
@@ -127,8 +149,8 @@ def rerank_with_llm(query: str, candidates: list) -> list:
     for i, c in enumerate(candidates):
         name = c.get('name', '')
         desc = c.get('description', '')[:150]
-        types = c.get('test_type', '')
-        candidate_lines.append(f"{i}. {name} [Types: {types}] - {desc}")
+        test_types = c.get('test_type', '')
+        candidate_lines.append(f"{i}. {name} [Types: {test_types}] - {desc}")
 
     candidates_text = "\n".join(candidate_lines)
 
@@ -150,21 +172,25 @@ Return ONLY the index numbers of the 10 most relevant assessments, ordered from 
 Format: 0, 5, 12, 3, 8, 1, 15, 7, 20, 11"""
 
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
+        def _gen():
+            return client.models.generate_content(
+                model='gemini-2.5-flash-lite',
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0),
+            )
+        response = _call_with_retry(_gen)
         text = response.text.strip()
-        # Parse indices from response
+        # Parse indices from response — extract all numbers via regex for robustness
         indices = []
-        for part in text.replace('\n', ',').split(','):
-            part = part.strip().rstrip('.')
-            if part.isdigit():
-                idx = int(part)
-                if 0 <= idx < len(candidates) and idx not in indices:
-                    indices.append(idx)
+        for match in re.finditer(r'\b(\d+)\b', text):
+            idx = int(match.group(1))
+            if 0 <= idx < len(candidates) and idx not in indices:
+                indices.append(idx)
             if len(indices) >= 10:
                 break
+        # Fallback: if parsing produced nothing, return distance-sorted top 10
+        if not indices:
+            indices = list(range(min(10, len(candidates))))
         return indices
     except Exception as e:
         logger.error("Rerank LLM Error: %s", e)
@@ -244,9 +270,34 @@ def _retrieve_candidates(search_queries: list, target_types: list) -> dict:
     return candidates
 
 
+def _is_technical_dominant(target_types: list, reranked: list) -> bool:
+    """Detect if the query is primarily technical/knowledge-focused.
+    Returns True when hard-skill types (K, S) make up the vast majority
+    of both the requested types AND the re-ranked results, meaning
+    forced diversification into soft-skill types would hurt relevance."""
+    hard_types = {'K', 'S'}
+    soft_types = {'P', 'A', 'B', 'C', 'D', 'E'}
+    # If targets are all hard-skill types, definitely technical
+    if set(target_types).issubset(hard_types):
+        return True
+    # If >=70% of re-ranked items are hard-skill, treat as technical-dominant
+    if reranked:
+        hard_count = sum(1 for item in reranked
+                         if any(t in hard_types for t in item["test_type"]))
+        if hard_count / len(reranked) >= 0.7:
+            return True
+    return False
+
+
 def _balance_results(reranked: list, candidates: dict, target_types: list) -> list:
-    """proportional type balancing across target types."""
+    """Proportional type balancing across target types.
+    Skips forced round-robin when the query is predominantly technical,
+    so pure-skill queries are not diluted with irrelevant personality tests."""
     if len(target_types) <= 1:
+        return reranked[:10]
+
+    # For technical-dominant queries, trust the LLM re-ranking order
+    if _is_technical_dominant(target_types, reranked):
         return reranked[:10]
 
     final, used_urls = [], set()
@@ -272,12 +323,15 @@ def _balance_results(reranked: list, candidates: dict, target_types: list) -> li
                 type_buckets[t].append(item)
                 break
 
-    # Round-robin fill — fair slots per type
-    slots_per_type = max(2, 10 // len(target_types))
+    # Weighted slot allocation — give more slots to types with more re-ranked hits
+    type_hit_counts = {t: len(type_buckets[t]) for t in target_types}
+    total_hits = sum(type_hit_counts.values()) or 1
     for t in target_types:
+        # Proportional slots (min 1, max 7) instead of equal split
+        slots = max(1, min(7, round(10 * type_hit_counts[t] / total_hits)))
         count = 0
         for item in type_buckets[t]:
-            if count >= slots_per_type or len(final) >= 10:
+            if count >= slots or len(final) >= 10:
                 break
             if item["url"] not in used_urls:
                 final.append(item)
@@ -312,7 +366,7 @@ def recommend_assessments(request: QueryRequest):
 
         # LLM query expansion
         analysis = generate_search_queries(query_text)
-        print(f"Generated search queries: {analysis['search_queries']} and target types: {analysis['types']}")
+        print(f"Generated search target types: {analysis['types']}")
         # Retrieval with type gap filling
         candidates = _retrieve_candidates(analysis["search_queries"], analysis["types"])
         if not candidates:

@@ -133,6 +133,24 @@ python test.py
 
 Both use **Mean Recall@10** against labeled training data from `data/Gen_AI Dataset.xlsx`.
 
+## Evaluation Results
+
+| Stage | Metric | Score |
+|-------|--------|-------|
+| Retrieval (vector search only) | Mean Recall@10 | 0.28 |
+| End-to-End (full pipeline) | Mean Recall@10 | 0.41 |
+
+> **Note:** Scores measured on the 10-query Train-Set from `Gen_AI Dataset.xlsx`. Results may vary slightly due to LLM re-ranking non-determinism (mitigated by `temperature=0`).
+
+### Iteration History
+
+| Iteration | Strategy | Mean Recall@10 |
+|-----------|----------|----------------|
+| Baseline | Direct vector search (MiniLM symmetric) | ~0.15 |
+| Iter 1 | Gemini asymmetric embeddings + multi-query expansion | ~0.22 |
+| Iter 2 | + LLM re-ranking + type-aware gap filling + balancing | ~0.29 |
+| Iter 3 | + Deterministic ranking (temp=0) + smart type balancing | ~0.41 |
+
 ## Re-scraping (optional)
 
 To refresh the assessment catalog:
